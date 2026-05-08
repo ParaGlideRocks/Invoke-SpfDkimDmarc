@@ -55,40 +55,48 @@ function Get-SPFRecord {
         }
 
         $SpfObject = New-Object System.Collections.Generic.List[System.Object]
+
+        function Get-SpfTxtRecord {
+            param(
+                [Parameter(Mandatory = $true)]
+                [string]$DomainName
+            )
+
+            if ($OsPlatform -eq "Windows") {
+                return Resolve-DnsName -Name $DomainName -Type TXT @SplatParameters |
+                    Where-Object { $_.Strings -match "v=spf1" } |
+                    Select-Object -ExpandProperty Strings -ErrorAction SilentlyContinue
+            }
+
+            $digArguments = @()
+            if ($Server) {
+                $digArguments += "@$Server"
+            }
+
+            $digArguments += @("TXT", $DomainName, "+short")
+
+            $spfRecord = & dig @digArguments | grep "v=spf1" | Out-String
+            return ($spfRecord -split '" "') -join ""
+        }
     }
 
     Process {
         foreach ($domain in $Name) {
             Write-Verbose "Processing domain: $domain"
 
+            $SPF = $null
+            $SpfAdvisory = $null
+            $SpfTotalLenght = 0
+            $SpfDnsLookupCount = 0
+
             # Get SPF record from specified domain
-            if ($OsPlatform -eq "Windows") {
-                $SPF = Resolve-DnsName -Name $domain -Type TXT @SplatParameters | where-object { $_.strings -match "v=spf1" } | Select-Object -ExpandProperty strings -ErrorAction SilentlyContinue
-            }
-            Elseif ($OsPlatform -eq "macOS" -or $OsPlatform -eq "Linux") {
-                $SPF = $(dig TXT $domain +short | grep "v=spf1" | Out-String)
-                $SPF = $SPF -split '" "' -join ""
-            }
-            Elseif ($OsPlatform -eq "macOS" -or $OsPlatform -eq "Linux" -and $Server) {
-                $SPF = $(dig TXT $domain +short NS @$SplatParameters.Server | grep "v=spf1" | Out-String)
-                $SPF = $SPF -split '" "' -join ""
-            }
+            $SPF = Get-SpfTxtRecord -DomainName $domain
             
             # Checks for SPF redirect and follow the redirect
             if ($SPF -match "redirect") {
                 $redirect = $SPF.Split(" ")
                 $RedirectName = $redirect -match "redirect" -replace "redirect="
-                if ($OsPlatform -eq "Windows") {
-                    $SPF = Resolve-DnsName -Name "$RedirectName" -Type TXT @SplatParameters | where-object { $_.strings -match "v=spf1" } | Select-Object -ExpandProperty strings -ErrorAction SilentlyContinue
-                }
-                elseif ($OsPlatform -eq "macOS" -or $POslatform -eq "Linux") {
-                    $SPF = $(dig TXT $RedirectName +short | grep "v=spf1" | Out-String)
-                    $SPF = $SPF -split '" "' -join ""
-                }
-                Elseif ($OsPlatform -eq "macOS" -or $OsPlatform -eq "Linux" -and $Server) {
-                    $SPF = $(dig TXT $RedirectName +short NS @$SplatParameters.Server | grep "v=spf1" | Out-String)
-                    $SPF = $SPF -split '" "' -join ""
-                }
+                $SPF = Get-SpfTxtRecord -DomainName $RedirectName
             }
 
             # Check for multiple SPF records
@@ -103,8 +111,7 @@ function Get-SPFRecord {
                 $SpfAdvisory = "Domain has more than one SPF record. Only one SPF record per domain is allowed. This is explicitly defined in RFC4408."     
                 $SpfTotalLenght = 0
                 foreach ($char in $SPF) {
-                    $SPFTotalLenght += $char.Length
-                    $SpfTotalLenght
+                    $SpfTotalLenght += $char.Length
                 }
             }
             Else {
@@ -124,19 +131,19 @@ function Get-SPFRecord {
             
                 switch -Regex ($SPF) {
                     '~all' {
-                        $SpfAdvisory += "An SPF-record is configured but the policy is not sufficiently strict."
+                        $SpfAdvisory += "Soft fail policy (~all)."
                     }
                     '-all' {
-                        $SpfAdvisory += "An SPF-record is configured and the policy is sufficiently strict."
+                        $SpfAdvisory += "Strict policy (-all)."
                     }
                     "\?all" {
-                        $SpfAdvisory += "Your domain has a valid SPF record but your policy is not effective enough."
+                        $SpfAdvisory += "Neutral policy (?all)."
                     }
                     '\+all' {
-                        $SpfAdvisory += "Your domain has a valid SPF record but your policy is not effective enough."
+                        $SpfAdvisory += "Permissive policy (+all)."
                     }
                     Default {
-                        $SpfAdvisory += "No qualifier found. Your domain has a SPF record but your policy is not effective enough."
+                        $SpfAdvisory += "No terminal all-qualifier found."
                     }
                 }
             }
@@ -145,8 +152,7 @@ function Get-SPFRecord {
             # SPF record MUST not exceed 10 DNS Lookups
             # See: https://datatracker.ietf.org/doc/html/rfc7208#section-4.6.4
             Write-Verbose "Starting calculation of SPF DNS Lookup count"
-            $SpfDnsLookupCount = 0
-            $includedDomain
+            $includedDomain = $null
 
             # Get the mechanisms that count towards the DNS lookup limit
             $SpfDnsLookupCountMechanisms = $SPF -split " " | Where-Object { $_ -match "^(include:|a:|mx:|a$|mx$|ptr$)" }
@@ -158,15 +164,7 @@ function Get-SPFRecord {
                         $SpfDnsLookupCount += 1
                         $includedDomain = $Matches[1]
                         try {
-                            if ($OsPlatform -eq "Windows") {
-                                $includedSpfRecord = Resolve-DnsName -Name $includedDomain -Type TXT @SplatParameters | where-object { $_.strings -match "v=spf1" } | Select-Object -ExpandProperty strings -ErrorAction SilentlyContinue
-                            }
-                            elseif ($OsPlatform -eq "macOS" -or $OsPlatform -eq "Linux") {
-                                $includedSpfRecord = $(dig TXT $includedDomain +short | grep "v=spf1" | Out-String)
-                            }
-                            elseif ($OsPlatform -eq "macOS" -or $OsPlatform -eq "Linux" -and $Server) {
-                                $includedSpfRecord = $(dig TXT $includedDomain +short NS @$SplatParameters.Server | grep "v=spf1" | Out-String)
-                            }
+                            $includedSpfRecord = Get-SpfTxtRecord -DomainName $includedDomain
                             
                             $includedSpfRecord -split " " | ForEach-Object {
                                 switch -Regex ($_) {
@@ -190,36 +188,32 @@ function Get-SPFRecord {
                                         Write-Verbose "Found nested include: $($Matches[1]) in $($SpfDnsLookupCountMechanism)"
                                         $SpfDnsLookupCount += 1
                                         try {
-                                            if ($OsPlatform -eq "Windows") {
-                                                $nestedIncludedSpfRecord = Resolve-DnsName -Name $Matches[1] -Type TXT @SplatParameters | where-object { $_.strings -match "v=spf1" } | Select-Object -ExpandProperty strings -ErrorAction SilentlyContinue
-                                            } elseif ($OsPlatform -eq "macOS" -or $OsPlatform -eq "Linux") {
-                                                $nestedIncludedSpfRecord = $(dig TXT $Matches[1] +short | grep "v=spf1" | Out-String)
-                                            } elseif ($OsPlatform -eq "macOS" -or $OsPlatform -eq "Linux" -and $Server) {
-                                                $nestedIncludedSpfRecord = $(dig TXT $Matches[1] +short NS @$SplatParameters.Server | grep "v=spf1" | Out-String)
-                                            }
+                                            $nestedIncludedSpfRecord = Get-SpfTxtRecord -DomainName $Matches[1]
                                             
-                                            switch -Regex ($nestedIncludedSpfRecord) {
-                                                "^include:(\S+)" {
-                                                    $SpfDnsLookupCount += 1
-                                                    Write-Verbose "Counting nested $($_) mechanism for DNS lookup, total so far: $SpfDnsLookupCount"
+                                            $nestedIncludedSpfRecord -split " " | ForEach-Object {
+                                                switch -Regex ($_) {
+                                                    "^include:(\S+)" {
+                                                        $SpfDnsLookupCount += 1
+                                                        Write-Verbose "Counting nested $($_) mechanism for DNS lookup, total so far: $SpfDnsLookupCount"
+                                                    }
+                                                    "^a:" {
+                                                        $SpfDnsLookupCount += 1
+                                                        Write-Verbose "Counting nested $($_) mechanism for DNS lookup, total so far: $SpfDnsLookupCount"
+                                                    }
+                                                    "^a$" {
+                                                        $SpfDnsLookupCount += 1
+                                                        Write-Verbose "Counting nested $($_) mechanism for DNS lookup, total so far: $SpfDnsLookupCount"
+                                                    }
+                                                    "^mx$" {
+                                                        $SpfDnsLookupCount += 1
+                                                        Write-Verbose "Counting nested $($_) mechanism for DNS lookup, total so far: $SpfDnsLookupCount"
+                                                    }
+                                                    "^ptr$" {
+                                                        $SpfDnsLookupCount += 1
+                                                        Write-Verbose "Counting nested $($_) mechanism for DNS lookup, total so far: $SpfDnsLookupCount"
+                                                    }
                                                 }
-                                                "^a:" {
-                                                    $SpfDnsLookupCount += 1
-                                                    Write-Verbose "Counting nested $($_) mechanism for DNS lookup, total so far: $SpfDnsLookupCount"
-                                                }
-                                                "^a$" {
-                                                    $SpfDnsLookupCount += 1
-                                                    Write-Verbose "Counting nested $($_) mechanism for DNS lookup, total so far: $SpfDnsLookupCount"
-                                                }
-                                                "^mx$" {
-                                                    $SpfDnsLookupCount += 1
-                                                    Write-Verbose "Counting nested $($_) mechanism for DNS lookup, total so far: $SpfDnsLookupCount"
-                                                }
-                                                "^ptr$" {
-                                                    $SpfDnsLookupCount += 1
-                                                    Write-Verbose "Counting nested $($_) mechanism for DNS lookup, total so far: $SpfDnsLookupCount"
-                                                }
-                                            }                                     
+                                            }
                                         }
                                         Catch {
                                             Write-Error "Failed to resolve SPF record for $($Matches[1])"
@@ -251,8 +245,6 @@ function Get-SPFRecord {
                     }
                 }
             }
-        }   
-        foreach ($domain in $name) {
 
             $SpfReturnValues = New-Object psobject
             $SpfReturnValues | Add-Member NoteProperty "Name" $domain
